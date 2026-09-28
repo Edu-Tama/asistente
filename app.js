@@ -15,6 +15,7 @@ const S = {
   areas: [], tareas: [], eventos: [], notas: [], personas: [], vencimientos: [],
   filtroArea: '', filtroEstado: 'abiertas', agendaDesde: null, textoNotas: '',
   resultados: null, q: '', installPrompt: null,
+  dispositivos: [], comandos: [],
   prefs: {}, avisos: { soportado: false, activos: false, permiso: 'default' }
 };
 const PREFS_DEFECTO = { aviso_min: 15, hora_resumen: '08:00', hora_avisos: '09:00', resumen_activo: true };
@@ -206,10 +207,14 @@ async function cargar() {
     return q;
   });
   consultas.push(sb.from('preferencias').select('clave, valor'));
+  consultas.push(sb.from('dispositivos').select('id, nombre, tipo, ultimo_latido, capacidades'));
+  consultas.push(sb.from('comandos').select('id, tipo, estado, resultado, created_at, terminado_en').order('created_at', { ascending: false }).limit(5));
   const res = await Promise.all(consultas);
   const err = res.find((r) => r.error);
   if (err) throw err.error;
   S.prefs = Object.fromEntries((res[TABLAS.length].data || []).map((r) => [r.clave, r.valor]));
+  S.dispositivos = res[TABLAS.length + 1].data || [];
+  S.comandos = res[TABLAS.length + 2].data || [];
   TABLAS.forEach((t, i) => { S[t] = res[i].data || []; });
   try { localStorage.setItem('asistente-cache', JSON.stringify(Object.fromEntries(TABLAS.map((t) => [t, S[t]])))); } catch (e) { /* sin espacio */ }
 }
@@ -251,7 +256,7 @@ function escucharCambios() {
   if (canal) sb.removeChannel(canal);
   const r = debounce(refrescar, 400);
   canal = sb.channel('cambios');
-  TABLAS.forEach((t) => canal.on('postgres_changes', { event: '*', schema: 'public', table: t }, r));
+  TABLAS.concat(['comandos']).forEach((t) => canal.on('postgres_changes', { event: '*', schema: 'public', table: t }, r));
   canal.subscribe();
 }
 
@@ -374,7 +379,8 @@ function htmlTarea(t) {
 function htmlEvento(o) {
   const e = o.ev;
   const hora = e.todo_el_dia ? 'Todo el día' : hm(o.inicio);
-  const meta = [chipArea(e.area_id), e.lugar ? esc(e.lugar) : '', e.recurrencia ? '↻ ' + esc(textoRR(e.recurrencia)) : ''].filter(Boolean);
+  const meta = [chipArea(e.area_id), e.es_teams ? '<span>Teams</span>' : (e.lugar ? esc(e.lugar) : ''), e.origen === 'outlook' ? '<span>Outlook</span>' : '',
+    e.recurrencia ? '↻ ' + esc(textoRR(e.recurrencia)) : ''].filter(Boolean);
   return `<div class="item"><span class="time" ${e.todo_el_dia ? 'style="font-size:12px"' : ''}>${hora}</span>
     <button class="item-main" data-action="editar" data-tipo="evento" data-id="${e.id}">
       <span class="item-title">${esc(e.titulo)}</span>${meta.length ? `<span class="item-meta">${meta.join('')}</span>` : ''}
@@ -575,6 +581,38 @@ function seccionAvisos() {
     </div>
     <div class="item"><label class="check-line"><input type="checkbox" data-pref="resumen_activo" data-tipo-pref="bool" ${pref('resumen_activo') ? 'checked' : ''}>Enviar el resumen de cada mañana</label></div>`);
 }
+function hace(iso) {
+  if (!iso) return 'nunca';
+  const min = Math.round((Date.now() - new Date(iso)) / 60000);
+  if (min < 1) return 'ahora mismo'; if (min < 60) return `hace ${min} min`;
+  const h = Math.round(min / 60); if (h < 24) return `hace ${h} h`; return `hace ${Math.round(h / 24)} d`;
+}
+const TEXTO_ORDEN = { sincronizar_outlook: 'Sincronizar Outlook', ejecutar_pipeline: 'Ejecutar pipeline' };
+function seccionDispositivos() {
+  const pcs = S.dispositivos.filter((d) => d.tipo !== 'android');
+  const filas = S.dispositivos.map((d) => {
+    const vivo = d.ultimo_latido && (Date.now() - new Date(d.ultimo_latido)) < 3 * 60000;
+    const nodo = (d.capacidades || []).includes('outlook');
+    return `<div class="item"><span class="item-main"><span class="item-title">${esc(d.nombre)}</span>
+      <span class="item-meta">${nodo ? `<span class="${vivo ? '' : 'late'}">${vivo ? 'Nodo activo' : 'Nodo apagado'} · último contacto ${hace(d.ultimo_latido)}</span>` : '<span>Avisos</span>'}</span></span>
+      ${nodo ? `<button class="btn ghost small" data-action="orden" data-tipo="sincronizar_outlook" data-id="${d.id}">Sincronizar Outlook</button>` : ''}</div>`;
+  }).join('');
+  const ordenes = S.comandos.map((c) => {
+    const r = c.resultado || {};
+    const det = c.estado === 'hecho' && c.tipo === 'sincronizar_outlook' ? ` · ${r.citas} citas, ${r.nuevos} nuevas, ${r.cambios} cambios, ${r.bajas} bajas`
+      : c.estado === 'error' ? ' · ' + esc(String(r.error || '').slice(0, 120)) : '';
+    return `<div class="item"><span class="item-main"><span class="item-title">${esc(TEXTO_ORDEN[c.tipo] || c.tipo)}</span>
+      <span class="item-meta"><span class="${c.estado === 'error' ? 'late' : ''}">${esc(String(c.estado || 'pendiente').replace('_', ' '))}${det}</span><span>${hace(c.created_at)}</span></span></span></div>`;
+  }).join('');
+  return seccion('Dispositivos', filas || vacio('Aún no hay dispositivos. Activa los avisos o instala el nodo del PC.'))
+    + (ordenes ? seccion('Últimas órdenes al PC', ordenes) : '')
+    + (pcs.some((d) => (d.capacidades || []).includes('outlook')) ? '' : '<p class="hint">Instala el nodo en el PC del trabajo para traer tu calendario de Outlook y usar la captura rápida con Ctrl+Alt+Espacio.</p>');
+}
+async function enviarOrden(tipo, dispositivoId, payload) {
+  const { error } = await sb.from('comandos').insert({ tipo, dispositivo_id: dispositivoId || null, payload: payload || {} });
+  if (error) { toast('No se pudo enviar la orden: ' + error.message); return; }
+  toast('Orden enviada al PC'); await refrescar();
+}
 function vistaAjustes() {
   const areas = S.areas.map((a) => `<div class="area-row">
     <input type="color" value="${esc(a.color)}" data-area="${a.id}" data-campo="color" aria-label="Color de ${esc(a.nombre)}">
@@ -585,8 +623,9 @@ function vistaAjustes() {
       <button class="btn ghost small" data-action="salir">Cerrar sesión</button></div>
     ${S.installPrompt ? '<div class="item"><span class="item-main"><span class="item-title">Instalar la app</span><span class="item-meta">Acceso directo como una app más</span></span><button class="btn primary small" data-action="instalar">Instalar</button></div>' : ''}`)
     + seccionAvisos()
+    + seccionDispositivos()
     + seccion('Áreas', areas + `<div class="item"><button class="btn ghost small" data-action="nueva-area">+ Nueva área</button></div>`)
-    + `<p class="hint">Asistente · versión 3 (núcleo y avisos). Próximamente: el asistente con IA y el nodo del PC.</p>`;
+    + `<p class="hint">Asistente · versión 4 (núcleo, avisos y nodo del PC). Próximamente: el asistente con IA.</p>`;
 }
 
 /* ---------- Render y navegación ---------- */
@@ -733,8 +772,10 @@ function abrirForm(tipo, id, preset) {
   if (id && !item) { toast('No encontrado (¿está sincronizado?)'); return; }
   const datos = item || preset || {};
   const m = $('#modal');
+  const avisoOutlook = item && item.origen === 'outlook'
+    ? '<p class="hint" style="margin:0">Este evento viene de Outlook: los cambios de fecha o título hazlos en Outlook (aquí se sobrescribirían en la próxima sincronización).</p>' : '';
   m.innerHTML = `<form method="dialog" data-form="entidad" data-tipo="${tipo}" data-id="${id || ''}">
-    <h2>${item ? 'Editar' : 'Nueva'} ${F.titulo.toLowerCase()}</h2>${F.campos(datos)}
+    <h2>${item ? 'Editar' : 'Nueva'} ${F.titulo.toLowerCase()}</h2>${avisoOutlook}${F.campos(datos)}
     <div class="actions">${item ? '<button type="button" class="btn danger" data-action="borrar">Eliminar</button><span class="spacer"></span>' : ''}
       <button type="button" class="btn ghost" data-action="cerrar">Cancelar</button>
       <button type="submit" class="btn primary">Guardar</button></div></form>`;
@@ -778,6 +819,7 @@ document.addEventListener('click', async (ev) => {
     else if (a === 'nueva-area') { await guardar('areas', { nombre: 'Nueva área', orden: S.areas.length + 1 }); }
     else if (a === 'archivar-area') { const ar = areaDe(id); await guardar('areas', { archivada: !ar.archivada }, id); }
     else if (a === 'signup') await registrarse();
+    else if (a === 'orden') await enviarOrden(b.dataset.tipo, id);
     else if (a === 'activar-avisos') await activarAvisos();
     else if (a === 'probar-avisos') await probarAvisos();
     else if (a === 'desactivar-avisos') await desactivarAvisos();
