@@ -14,8 +14,10 @@ const S = {
   user: null, view: 'hoy',
   areas: [], tareas: [], eventos: [], notas: [], personas: [], vencimientos: [],
   filtroArea: '', filtroEstado: 'abiertas', agendaDesde: null, textoNotas: '',
-  resultados: null, q: '', installPrompt: null
+  resultados: null, q: '', installPrompt: null,
+  prefs: {}, avisos: { soportado: false, activos: false, permiso: 'default' }
 };
+const PREFS_DEFECTO = { aviso_min: 15, hora_resumen: '08:00', hora_avisos: '09:00', resumen_activo: true };
 
 const AREAS_INICIALES = [
   { nombre: 'Trabajo', ambito: 'profesional', color: '#B93A0B', orden: 1 },
@@ -203,9 +205,11 @@ async function cargar() {
     if (t === 'areas') q = q.order('orden');
     return q;
   });
+  consultas.push(sb.from('preferencias').select('clave, valor'));
   const res = await Promise.all(consultas);
   const err = res.find((r) => r.error);
   if (err) throw err.error;
+  S.prefs = Object.fromEntries((res[TABLAS.length].data || []).map((r) => [r.clave, r.valor]));
   TABLAS.forEach((t, i) => { S[t] = res[i].data || []; });
   try { localStorage.setItem('asistente-cache', JSON.stringify(Object.fromEntries(TABLAS.map((t) => [t, S[t]])))); } catch (e) { /* sin espacio */ }
 }
@@ -234,7 +238,7 @@ async function borrar(tabla, id) {
   toast('Eliminado'); await refrescar();
 }
 async function refrescar() {
-  try { await cargar(); estadoSync(true); } catch (e) { estadoSync(false); }
+  try { await cargar(); await asegurarAreas(); estadoSync(true); } catch (e) { estadoSync(false); }
   render();
 }
 function estadoSync(ok) {
@@ -277,6 +281,72 @@ async function resolverVencimiento(id) {
     await guardar('vencimientos', { resuelto_en: new Date().toISOString() }, id);
     toast('Marcado como resuelto');
   }
+}
+
+/* ---------- Avisos (notificaciones push) ---------- */
+const pref = (k) => (S.prefs[k] !== undefined ? S.prefs[k] : PREFS_DEFECTO[k]);
+async function guardarPref(clave, valor) {
+  const { error } = await sb.from('preferencias').upsert({ user_id: S.user.id, clave, valor }, { onConflict: 'user_id,clave' });
+  if (error) { toast('No se pudo guardar: ' + error.message); return; }
+  S.prefs[clave] = valor; toast('Preferencia guardada');
+}
+function b64aBytes(b64) {
+  const s = (b64 + '='.repeat((4 - b64.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(s); return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+async function estadoAvisos() {
+  const A = S.avisos;
+  A.soportado = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  if (!A.soportado) return;
+  A.permiso = Notification.permission;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    const sub = reg ? await reg.pushManager.getSubscription() : null;
+    A.activos = !!sub && A.permiso === 'granted';
+  } catch (e) { A.activos = false; }
+}
+function nombreDispositivo() {
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) return ['Android', 'android'];
+  if (/iPhone|iPad/i.test(ua)) return ['iPhone', 'otro'];
+  return [/Windows/i.test(ua) ? 'PC Windows' : 'Ordenador', 'otro'];
+}
+async function activarAvisos() {
+  if (!S.avisos.soportado) { toast('Este navegador no admite avisos'); return; }
+  if (!window.isSecureContext) { toast('Los avisos solo funcionan desde la dirección https de la app'); return; }
+  const permiso = await Notification.requestPermission();
+  S.avisos.permiso = permiso;
+  if (permiso !== 'granted') { toast('Permiso denegado. Actívalo en los ajustes del navegador para esta web.'); render(); return; }
+  toast('Activando avisos…');
+  const { data, error } = await sb.functions.invoke('avisos', { body: { accion: 'clave' } });
+  if (error || !data || !data.publicKey) { toast('No se pudo contactar con el servidor de avisos'); console.error(error); return; }
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64aBytes(data.publicKey) });
+  const j = sub.toJSON();
+  const [nombre, tipo] = nombreDispositivo();
+  let dispId = localStorage.getItem('asistente-dispositivo');
+  if (!dispId) {
+    const r = await sb.from('dispositivos').insert({ nombre, tipo, capacidades: ['avisos'] }).select('id').single();
+    if (r.error) { toast('Error al registrar el dispositivo: ' + r.error.message); return; }
+    dispId = r.data.id; localStorage.setItem('asistente-dispositivo', dispId);
+  }
+  const { error: e2 } = await sb.from('suscripciones_push').upsert(
+    { user_id: S.user.id, dispositivo_id: dispId, endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth }, { onConflict: 'endpoint' });
+  if (e2) { toast('Error al guardar la suscripción: ' + e2.message); return; }
+  S.avisos.activos = true; render();
+  await probarAvisos();
+}
+async function probarAvisos() {
+  const { data, error } = await sb.functions.invoke('avisos', { body: { accion: 'prueba' } });
+  if (error) { toast('No se pudo enviar la prueba'); console.error(error); return; }
+  toast(data && data.enviados ? `Prueba enviada a ${data.enviados} dispositivo(s)` : 'No hay dispositivos con avisos activos');
+}
+async function desactivarAvisos() {
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = reg ? await reg.pushManager.getSubscription() : null;
+  if (sub) { await sb.from('suscripciones_push').delete().eq('endpoint', sub.endpoint); await sub.unsubscribe(); }
+  S.avisos.activos = false; toast('Avisos desactivados en este dispositivo'); render();
 }
 
 /* ---------- Plantillas de elementos ---------- */
@@ -486,6 +556,25 @@ function vistaMas() {
   return `<div class="card menu-list">${items.map(([v, t]) => `<button data-action="goto" data-view="${v}">${svg(v)}${t}</button>`).join('')}</div>`;
 }
 
+function seccionAvisos() {
+  const A = S.avisos;
+  let estado;
+  if (!A.soportado) estado = '<span class="item-meta">Este navegador no admite avisos. En el móvil, usa Chrome e instala la app.</span>';
+  else if (A.permiso === 'denied') estado = '<span class="item-meta late">Bloqueados por el navegador: permite las notificaciones para esta web en los ajustes del navegador.</span>';
+  else if (A.activos) estado = '<span class="item-meta">Activados en este dispositivo</span>';
+  else estado = '<span class="item-meta">Desactivados en este dispositivo</span>';
+  const boton = !A.soportado || A.permiso === 'denied' ? '' : A.activos
+    ? '<button class="btn ghost small" data-action="probar-avisos">Probar</button><button class="btn ghost small" data-action="desactivar-avisos">Desactivar</button>'
+    : '<button class="btn primary small" data-action="activar-avisos">Activar</button>';
+  const minutos = [5, 10, 15, 30, 60].map((m) => `<option value="${m}" ${+pref('aviso_min') === m ? 'selected' : ''}>${m} min antes</option>`).join('');
+  return seccion('Avisos', `<div class="item"><span class="item-main"><span class="item-title">Avisos en este dispositivo</span>${estado}</span><span style="display:flex;gap:6px;flex-wrap:wrap">${boton}</span></div>
+    <div class="item" style="flex-wrap:wrap">
+      <label style="flex:1;min-width:150px">Antelación (eventos y tareas con hora)<select data-pref="aviso_min" data-tipo-pref="num">${minutos}</select></label>
+      <label style="flex:1;min-width:130px">Resumen diario<input type="time" data-pref="hora_resumen" value="${esc(pref('hora_resumen'))}"></label>
+      <label style="flex:1;min-width:130px">Vencimientos y cumpleaños<input type="time" data-pref="hora_avisos" value="${esc(pref('hora_avisos'))}"></label>
+    </div>
+    <div class="item"><label class="check-line"><input type="checkbox" data-pref="resumen_activo" data-tipo-pref="bool" ${pref('resumen_activo') ? 'checked' : ''}>Enviar el resumen de cada mañana</label></div>`);
+}
 function vistaAjustes() {
   const areas = S.areas.map((a) => `<div class="area-row">
     <input type="color" value="${esc(a.color)}" data-area="${a.id}" data-campo="color" aria-label="Color de ${esc(a.nombre)}">
@@ -495,8 +584,9 @@ function vistaAjustes() {
   return seccion('Cuenta', `<div class="item"><span class="item-main"><span class="item-title">${esc(S.user.email)}</span><span class="item-meta">Datos sincronizados entre todos tus dispositivos</span></span>
       <button class="btn ghost small" data-action="salir">Cerrar sesión</button></div>
     ${S.installPrompt ? '<div class="item"><span class="item-main"><span class="item-title">Instalar la app</span><span class="item-meta">Acceso directo como una app más</span></span><button class="btn primary small" data-action="instalar">Instalar</button></div>' : ''}`)
+    + seccionAvisos()
     + seccion('Áreas', areas + `<div class="item"><button class="btn ghost small" data-action="nueva-area">+ Nueva área</button></div>`)
-    + `<p class="hint">Asistente · ola 1 (núcleo). Próximamente: el asistente con IA, avisos al móvil y el nodo del PC.</p>`;
+    + `<p class="hint">Asistente · versión 3 (núcleo y avisos). Próximamente: el asistente con IA y el nodo del PC.</p>`;
 }
 
 /* ---------- Render y navegación ---------- */
@@ -688,6 +778,9 @@ document.addEventListener('click', async (ev) => {
     else if (a === 'nueva-area') { await guardar('areas', { nombre: 'Nueva área', orden: S.areas.length + 1 }); }
     else if (a === 'archivar-area') { const ar = areaDe(id); await guardar('areas', { archivada: !ar.archivada }, id); }
     else if (a === 'signup') await registrarse();
+    else if (a === 'activar-avisos') await activarAvisos();
+    else if (a === 'probar-avisos') await probarAvisos();
+    else if (a === 'desactivar-avisos') await desactivarAvisos();
   } catch (e) { console.error(e); }
 });
 
@@ -695,6 +788,13 @@ document.addEventListener('change', async (ev) => {
   const el = ev.target;
   if (el.matches('[data-rr]')) {
     const d = el.form.querySelector('[data-dias]'); if (d) d.hidden = el.value !== 'WEEKLY';
+  }
+  if (el.dataset.pref) {
+    const t = el.dataset.tipoPref;
+    const v = t === 'num' ? +el.value : t === 'bool' ? el.checked : el.value;
+    if (v === '' || v === null) return;
+    await guardarPref(el.dataset.pref, v);
+    return;
   }
   if (el.dataset.area) {
     const v = el.value.trim(); if (!v) return;
@@ -766,7 +866,7 @@ async function arrancarSesion(session) {
   if (hayCache) render();
   try { await cargar(); await asegurarAreas(); estadoSync(true); }
   catch (e) { console.error(e); estadoSync(false); if (!hayCache) toast('No se pudieron cargar los datos'); }
-  render(); escucharCambios();
+  await estadoAvisos(); render(); escucharCambios();
 }
 
 /* ---------- Arranque ---------- */
@@ -781,10 +881,12 @@ const actualizarRed = () => { $('#offline').hidden = navigator.onLine; if (navig
 window.addEventListener('online', actualizarRed); window.addEventListener('offline', actualizarRed);
 $('#offline').hidden = navigator.onLine;
 document.addEventListener('visibilitychange', () => { if (!document.hidden && S.user && navigator.onLine) refrescar(); });
+window.addEventListener('hashchange', () => { const v = location.hash.slice(1); if (S.user && VISTAS[v] && v !== S.view) { S.view = v; render(); } });
+if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', (e) => { if (e.data && e.data.vista && VISTAS[e.data.vista]) irA(e.data.vista); });
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.installPrompt = e; if (S.view === 'ajustes') render(); });
 // Cada minuto: refrescar "Hoy" (horas, atrasadas) sin recargar datos
 setInterval(() => { if (S.user && !$('#modal').open && ['hoy', 'agenda'].includes(S.view) && !document.activeElement.matches('input,textarea')) render(); }, 60000);
-if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('sw.js').catch(() => {});
 
 // Exponer para pruebas
 window.__asistente = { S, parseRapido, ocurrencias, siguienteFecha };
