@@ -1,0 +1,21 @@
+{
+  "name": "Asistente personal",
+  "short_name": "Asistente",
+  "description": "Tareas, agenda, notas, personas y vencimientos: toda tu vida en un sitio",
+  "lang": "es",
+  "start_url": "./#hoy",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F4F1EA",
+  "theme_color": "#1F5F5B",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Hoy", "url": "./#hoy" },
+    { "name": "Tareas", "url": "./#tareas" },
+    { "name": "Agenda", "url": "./#agenda" }
+  ]
+}
