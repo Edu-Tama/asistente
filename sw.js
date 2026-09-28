@@ -1,6 +1,6 @@
 // Service worker: guarda la app para que abra al instante y sin conexión.
 // Los datos NO pasan por aquí (van directos a Supabase); la app guarda su propia copia.
-const VERSION = 'asistente-v4';
+const VERSION = 'asistente-v5';
 const ARCHIVOS = [
   './', 'index.html', 'styles.css', 'app.js', 'config.js', 'vendor/supabase.js', 'manifest.webmanifest',
   'fonts/fraunces-latin-600-normal.woff2', 'fonts/ibm-plex-sans-latin-400-normal.woff2',

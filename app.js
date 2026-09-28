@@ -15,7 +15,7 @@ const S = {
   areas: [], tareas: [], eventos: [], notas: [], personas: [], vencimientos: [],
   filtroArea: '', filtroEstado: 'abiertas', agendaDesde: null, textoNotas: '',
   resultados: null, q: '', installPrompt: null,
-  dispositivos: [], comandos: [],
+  dispositivos: [], comandos: [], calendarios: [],
   prefs: {}, avisos: { soportado: false, activos: false, permiso: 'default' }
 };
 const PREFS_DEFECTO = { aviso_min: 15, hora_resumen: '08:00', hora_avisos: '09:00', resumen_activo: true };
@@ -209,12 +209,14 @@ async function cargar() {
   consultas.push(sb.from('preferencias').select('clave, valor'));
   consultas.push(sb.from('dispositivos').select('id, nombre, tipo, ultimo_latido, capacidades'));
   consultas.push(sb.from('comandos').select('id, tipo, estado, resultado, created_at, terminado_en').order('created_at', { ascending: false }).limit(5));
+  consultas.push(sb.from('calendarios_externos').select('id, nombre, area_id, activo, ultimo_sync, ultimo_error, ultimo_resultado'));
   const res = await Promise.all(consultas);
   const err = res.find((r) => r.error);
   if (err) throw err.error;
   S.prefs = Object.fromEntries((res[TABLAS.length].data || []).map((r) => [r.clave, r.valor]));
   S.dispositivos = res[TABLAS.length + 1].data || [];
   S.comandos = res[TABLAS.length + 2].data || [];
+  S.calendarios = res[TABLAS.length + 3].data || [];
   TABLAS.forEach((t, i) => { S[t] = res[i].data || []; });
   try { localStorage.setItem('asistente-cache', JSON.stringify(Object.fromEntries(TABLAS.map((t) => [t, S[t]])))); } catch (e) { /* sin espacio */ }
 }
@@ -256,7 +258,7 @@ function escucharCambios() {
   if (canal) sb.removeChannel(canal);
   const r = debounce(refrescar, 400);
   canal = sb.channel('cambios');
-  TABLAS.concat(['comandos']).forEach((t) => canal.on('postgres_changes', { event: '*', schema: 'public', table: t }, r));
+  TABLAS.concat(['comandos', 'calendarios_externos']).forEach((t) => canal.on('postgres_changes', { event: '*', schema: 'public', table: t }, r));
   canal.subscribe();
 }
 
@@ -379,7 +381,7 @@ function htmlTarea(t) {
 function htmlEvento(o) {
   const e = o.ev;
   const hora = e.todo_el_dia ? 'Todo el día' : hm(o.inicio);
-  const meta = [chipArea(e.area_id), e.es_teams ? '<span>Teams</span>' : (e.lugar ? esc(e.lugar) : ''), e.origen === 'outlook' ? '<span>Outlook</span>' : '',
+  const meta = [chipArea(e.area_id), e.es_teams ? '<span>Teams</span>' : (e.lugar ? esc(e.lugar) : ''), e.origen === 'outlook' ? '<span>Outlook</span>' : e.origen === 'ics' ? '<span>Calendario</span>' : '',
     e.recurrencia ? '↻ ' + esc(textoRR(e.recurrencia)) : ''].filter(Boolean);
   return `<div class="item"><span class="time" ${e.todo_el_dia ? 'style="font-size:12px"' : ''}>${hora}</span>
     <button class="item-main" data-action="editar" data-tipo="evento" data-id="${e.id}">
@@ -608,6 +610,68 @@ function seccionDispositivos() {
     + (ordenes ? seccion('Últimas órdenes al PC', ordenes) : '')
     + (pcs.some((d) => (d.capacidades || []).includes('outlook')) ? '' : '<p class="hint">Instala el nodo en el PC del trabajo para traer tu calendario de Outlook y usar la captura rápida con Ctrl+Alt+Espacio.</p>');
 }
+function seccionCalendarios() {
+  const filas = S.calendarios.map((c) => {
+    const r = c.ultimo_resultado || {};
+    const estado = c.ultimo_error ? `<span class="late">Error: ${esc(c.ultimo_error.slice(0, 140))}</span>`
+      : c.ultimo_sync ? `<span>${r.eventos != null ? r.eventos + ' eventos · ' : ''}sincronizado ${hace(c.ultimo_sync)}</span>` : '<span>Pendiente de la primera sincronización</span>';
+    return `<div class="item"><span class="item-main"><span class="item-title">${esc(c.nombre)}</span>
+      <span class="item-meta">${chipArea(c.area_id)}${estado}</span></span>
+      <span style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn ghost small" data-action="cal-sync" data-id="${c.id}">Sincronizar</button>
+      <button class="btn ghost small" data-action="cal-quitar" data-id="${c.id}">Quitar</button></span></div>`;
+  }).join('');
+  return seccion('Calendarios conectados', (filas || vacio('Conecta tu calendario de Outlook web (o Google) con su enlace ICS publicado.'))
+    + '<div class="item"><button class="btn primary small" data-action="cal-nuevo">+ Conectar calendario</button></div>');
+}
+function abrirNuevoCalendario() {
+  const trabajo = S.areas.find((x) => norm(x.nombre) === 'trabajo');
+  const m = $('#modal');
+  m.innerHTML = `<form method="dialog" data-form="calendario">
+    <h2>Conectar calendario</h2>
+    <p class="hint" style="margin:0">En Outlook web: Configuración → Calendario → Calendarios compartidos → Publicar un calendario → permiso «Puede ver títulos y ubicaciones» → copia el enlace <b>ICS</b>.</p>
+    <label>Nombre<input type="text" name="nombre" required value="Outlook trabajo"></label>
+    <label>Enlace ICS<input type="url" name="url" required placeholder="https://outlook.office365.com/owa/calendar/…/calendar.ics" autocomplete="off"></label>
+    <label>Área<select name="area_id">${opcionesArea(trabajo ? trabajo.id : '')}</select></label>
+    <p class="hint" data-cal-estado style="margin:0" role="status"></p>
+    <div class="actions"><button type="button" class="btn ghost" data-action="cerrar">Cancelar</button>
+      <button type="submit" class="btn primary">Probar y conectar</button></div></form>`;
+  m.showModal();
+}
+async function conectarCalendario(f) {
+  const fd = new FormData(f); const estado = f.querySelector('[data-cal-estado]'); const boton = f.querySelector('[type=submit]');
+  const url = String(fd.get('url') || '').trim();
+  boton.disabled = true; estado.textContent = 'Leyendo el calendario…';
+  try {
+    const { data, error } = await sb.functions.invoke('avisos', { body: { accion: 'cal-probar', url } });
+    const msg = (data && data.error) || (error && (await leerErrorFuncion(error)));
+    if (msg) { estado.textContent = 'No se pudo leer: ' + msg; estado.classList.add('late'); return; }
+    estado.textContent = `Encontrados ${data.eventos} eventos en los próximos 60 días. Conectando…`;
+    const ins = await sb.from('calendarios_externos').insert({ nombre: fd.get('nombre'), url, area_id: fd.get('area_id') || null }).select('id').single();
+    if (ins.error) { estado.textContent = 'Error al guardar: ' + ins.error.message; return; }
+    await sb.functions.invoke('avisos', { body: { accion: 'cal-sincronizar', id: ins.data.id } });
+    $('#modal').close(); toast(`Calendario conectado: ${data.eventos} eventos`); await refrescar();
+  } finally { boton.disabled = false; }
+}
+async function leerErrorFuncion(error) {
+  try { const j = await error.context.json(); return j.error || error.message; } catch (e) { return error.message; }
+}
+async function sincronizarCalendario(id) {
+  toast('Sincronizando…');
+  const { data, error } = await sb.functions.invoke('avisos', { body: { accion: 'cal-sincronizar', id } });
+  const r = data && data.resultados && data.resultados[id];
+  if (error || !r) toast('No se pudo sincronizar');
+  else if (r.error) toast('Error: ' + r.error);
+  else toast(`Hecho: ${r.nuevos} nuevos, ${r.cambios} cambios, ${r.bajas} eliminados`);
+  await refrescar();
+}
+async function quitarCalendario(id) {
+  const c = S.calendarios.find((x) => x.id === id);
+  if (!confirm(`¿Desconectar «${c ? c.nombre : 'calendario'}»? Sus eventos desaparecerán de la agenda.`)) return;
+  await sb.from('eventos').update({ deleted_at: new Date().toISOString() }).eq('origen', 'ics').like('uid_externo', id + '|%');
+  const { error } = await sb.from('calendarios_externos').delete().eq('id', id);
+  if (error) { toast('No se pudo quitar: ' + error.message); return; }
+  toast('Calendario desconectado'); await refrescar();
+}
 async function enviarOrden(tipo, dispositivoId, payload) {
   const { error } = await sb.from('comandos').insert({ tipo, dispositivo_id: dispositivoId || null, payload: payload || {} });
   if (error) { toast('No se pudo enviar la orden: ' + error.message); return; }
@@ -623,9 +687,10 @@ function vistaAjustes() {
       <button class="btn ghost small" data-action="salir">Cerrar sesión</button></div>
     ${S.installPrompt ? '<div class="item"><span class="item-main"><span class="item-title">Instalar la app</span><span class="item-meta">Acceso directo como una app más</span></span><button class="btn primary small" data-action="instalar">Instalar</button></div>' : ''}`)
     + seccionAvisos()
+    + seccionCalendarios()
     + seccionDispositivos()
     + seccion('Áreas', areas + `<div class="item"><button class="btn ghost small" data-action="nueva-area">+ Nueva área</button></div>`)
-    + `<p class="hint">Asistente · versión 4 (núcleo, avisos y nodo del PC). Próximamente: el asistente con IA.</p>`;
+    + `<p class="hint">Asistente · versión 5 (núcleo, avisos, nodo del PC y calendarios). Próximamente: el asistente con IA.</p>`;
 }
 
 /* ---------- Render y navegación ---------- */
@@ -772,8 +837,8 @@ function abrirForm(tipo, id, preset) {
   if (id && !item) { toast('No encontrado (¿está sincronizado?)'); return; }
   const datos = item || preset || {};
   const m = $('#modal');
-  const avisoOutlook = item && item.origen === 'outlook'
-    ? '<p class="hint" style="margin:0">Este evento viene de Outlook: los cambios de fecha o título hazlos en Outlook (aquí se sobrescribirían en la próxima sincronización).</p>' : '';
+  const avisoOutlook = item && (item.origen === 'outlook' || item.origen === 'ics')
+    ? '<p class="hint" style="margin:0">Este evento viene de tu calendario de Outlook: los cambios de fecha o título hazlos allí (aquí se sobrescribirían en la próxima sincronización).</p>' : '';
   m.innerHTML = `<form method="dialog" data-form="entidad" data-tipo="${tipo}" data-id="${id || ''}">
     <h2>${item ? 'Editar' : 'Nueva'} ${F.titulo.toLowerCase()}</h2>${avisoOutlook}${F.campos(datos)}
     <div class="actions">${item ? '<button type="button" class="btn danger" data-action="borrar">Eliminar</button><span class="spacer"></span>' : ''}
@@ -820,6 +885,9 @@ document.addEventListener('click', async (ev) => {
     else if (a === 'archivar-area') { const ar = areaDe(id); await guardar('areas', { archivada: !ar.archivada }, id); }
     else if (a === 'signup') await registrarse();
     else if (a === 'orden') await enviarOrden(b.dataset.tipo, id);
+    else if (a === 'cal-nuevo') abrirNuevoCalendario();
+    else if (a === 'cal-sync') await sincronizarCalendario(id);
+    else if (a === 'cal-quitar') await quitarCalendario(id);
     else if (a === 'activar-avisos') await activarAvisos();
     else if (a === 'probar-avisos') await probarAvisos();
     else if (a === 'desactivar-avisos') await desactivarAvisos();
@@ -865,6 +933,8 @@ document.addEventListener('submit', async (ev) => {
       const { data, error } = await sb.rpc('buscar', { q: S.q, limite: 40 });
       if (error) { toast('Error al buscar: ' + error.message); return; }
       S.resultados = data || []; render();
+    } else if (tipo === 'calendario') {
+      await conectarCalendario(f);
     } else if (tipo === 'entidad') {
       const F = FORMS[f.dataset.tipo]; const id = f.dataset.id || null;
       const actual = id ? S[LISTAS[f.dataset.tipo]].find((x) => x.id === id) : undefined;
